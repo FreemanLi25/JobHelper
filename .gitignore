@@ -1,5 +1,29 @@
 __pycache__/
+.venv*/
 *.py[cod]
 build/
 dist/
 *.spec
+
+# Browser profile data (contains personal browsing data, cookies, credentials)
+EdgeProfile/
+
+# Temporary files and system directories
+C:/tmp/
+*.pma
+*.dat
+
+# OS generated files
+Thumbs.db
+.DS_Store
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python environment
+*.egg-info/
+.eggs/
+*.egg

@@ -1,10 +1,13 @@
 import random
 import re
+import socket
 import threading
 import time
 import traceback
 from queue import Empty, Queue
 from typing import Iterable, Optional
+from urllib.error import URLError
+from urllib.request import urlopen
 
 import customtkinter as ctk
 from DrissionPage import ChromiumPage
@@ -43,24 +46,42 @@ CITY_SELECTORS = [
 ]
 
 JOB_CARD_SELECTORS = [
+    "css:.job-card-box",
     "css:.job-card-wrapper",
     "css:.job-card-body",
+    "css:.job-list-container .job-card-box",
+    "css:.job-card-list .job-card-box",
+    "css:.search-job-result .job-card-box",
     "css:.job-list-box li",
     "css:.job-card-left",
+    "xpath://div[contains(@class, 'job-card-box') or contains(@class, 'job-card-wrapper') or contains(@class, 'job-card-body')]",
     "xpath://li[contains(@class, 'job-card') or contains(@class, 'job-list')]",
 ]
 
 SALARY_SELECTORS = [
+    "css:.salary-name",
+    "css:.job-salary",
     "css:.salary",
     "css:.red",
-    "xpath:.//*[contains(@class, 'salary') or contains(@class, 'red')]",
+    "xpath:.//*[contains(@class, 'salary') or contains(@class, 'red') or contains(@class, 'wage')]",
 ]
 
 JOB_NAME_SELECTORS = [
-    "css:.job-name",
     "css:.job-title",
+    "css:.job-name",
+    "css:.job-card-left .job-title",
+    "css:.job-card-body .job-title",
     "css:.name",
     "xpath:.//*[contains(@class, 'job-name') or contains(@class, 'job-title') or contains(@class, 'name')]",
+]
+
+COMPANY_SELECTORS = [
+    "css:.company-name",
+    "css:.company-text",
+    "css:.company-title",
+    "css:.job-card-footer .name",
+    "css:.job-card-footer span",
+    "xpath:.//*[contains(@class, 'company') or contains(@class, 'brand') or contains(@class, 'firm')]",
 ]
 
 COMMUNICATE_SELECTORS = [
@@ -74,6 +95,8 @@ NEXT_PAGE_SELECTORS = [
     "css:.pagination .next",
     "xpath://a[contains(., '下一页') and not(contains(@class, 'disabled'))]",
     "xpath://button[contains(., '下一页') and not(@disabled)]",
+    "xpath://button[contains(., '查看更多') and not(@disabled)]",
+    "xpath://a[contains(., '查看更多') and not(contains(@class, 'disabled'))]",
 ]
 
 CLOSE_POPUP_SELECTORS = [
@@ -85,6 +108,22 @@ CLOSE_POPUP_SELECTORS = [
     "xpath://i[contains(@class, 'close')]",
     "xpath://span[contains(@class, 'close')]",
 ]
+
+STAY_ON_PAGE_SELECTORS = [
+    "xpath://button[normalize-space()='留在此页']",
+    "xpath://a[normalize-space()='留在此页']",
+    "xpath://span[normalize-space()='留在此页']",
+    "xpath://button[contains(., '留在此页')]",
+    "xpath://a[contains(., '留在此页')]",
+]
+
+EXPERIENCE_OPTIONS = ["不限", "在校生", "应届生", "经验不限", "1年以内", "1-3年", "3-5年", "5-10年", "10年以上"]
+
+EXPERIENCE_ALIASES = {
+    "在校生": ["在校生", "在校"],
+    "应届生": ["应届生", "应届", "在校/应届", "校招"],
+    "经验不限": ["经验不限", "不限"],
+}
 
 
 def parse_salary_top_k(salary_text: str) -> Optional[int]:
@@ -98,7 +137,7 @@ def parse_salary_top_k(salary_text: str) -> Optional[int]:
     if not salary_text:
         return None
 
-    text = salary_text.strip()
+    text = normalize_boss_obfuscated_digits(salary_text).strip()
     lower_text = text.lower()
 
     if "k" not in lower_text:
@@ -124,6 +163,41 @@ def parse_salary_top_k(salary_text: str) -> Optional[int]:
     return None
 
 
+def normalize_boss_obfuscated_digits(text: str) -> str:
+    """还原 Boss 页面常见的私有区数字字符。
+
+    Boss 直聘部分页面会把薪资数字渲染成 Unicode 私有区字符：
+    U+E031-U+E03A 分别对应 0-9。比如 “-K” 实际是 “15-25K”。
+    """
+    if not text:
+        return ""
+
+    trans = {ord(chr(0xE031 + digit)): str(digit) for digit in range(10)}
+    return text.translate(trans)
+
+
+def clean_job_name(job_name: str, salary_text: str = "") -> str:
+    """清理卡片标题，避免职位名里混入薪资、经验、学历等多行信息。"""
+    if not job_name:
+        return "未识别职位名"
+
+    normalized = normalize_boss_obfuscated_digits(job_name).strip()
+    if salary_text:
+        normalized_salary = normalize_boss_obfuscated_digits(salary_text).strip()
+        normalized = normalized.replace(normalized_salary, "").strip()
+
+    normalized = re.split(r"\d+(?:\.\d+)?\s*[kK]\b|\d+(?:\.\d+)?\s*[-~—–至到]\s*\d+(?:\.\d+)?\s*[kK]", normalized)[0]
+    normalized = normalized.splitlines()[0].strip()
+    return normalized or "未识别职位名"
+
+
+def split_blocked_companies(text: str) -> list[str]:
+    """按中文/英文分号切分公司黑名单关键词。"""
+    if not text:
+        return []
+    return [item.strip().lower() for item in re.split(r"[；;]", text) if item.strip()]
+
+
 def salary_meets_requirement(salary_text: str, min_salary_k: int) -> bool:
     """判断薪资是否满足设定下限。"""
     top_k = parse_salary_top_k(salary_text)
@@ -144,11 +218,43 @@ class BossAutoGreeter:
     def connect_page(self) -> ChromiumPage:
         """固定接管 127.0.0.1:9222 的 Edge/Chromium 页面。"""
         self.log(f"正在连接浏览器调试端口：{DEBUGGER_ADDRESS}")
+        browser_info = self.ensure_debugger_port_ready()
+        self.log(f"检测到远程调试浏览器：{browser_info}")
         page = ChromiumPage(DEBUGGER_ADDRESS)
         self.page = page
         title = self.safe_get_title(page)
         self.log(f"浏览器连接成功，当前页面标题：{title or '未获取到标题'}")
         return page
+
+    def ensure_debugger_port_ready(self) -> str:
+        """先探测 9222 端口，避免 DrissionPage 在端口未开启时自动拉起 Chrome。"""
+        host, port_text = DEBUGGER_ADDRESS.split(":", 1)
+        port = int(port_text)
+
+        try:
+            with socket.create_connection((host, port), timeout=2):
+                pass
+        except OSError as exc:
+            raise RuntimeError(
+                "未检测到 127.0.0.1:9222 调试端口。请先运行 start_edge_debug.bat，"
+                "并确认 Edge 已打开后再点击测试连接。"
+            ) from exc
+
+        try:
+            with urlopen(f"http://{DEBUGGER_ADDRESS}/json/version", timeout=3) as response:
+                body = response.read().decode("utf-8", errors="replace")
+        except URLError as exc:
+            raise RuntimeError("9222 端口已打开，但无法读取 /json/version，请确认这是 Edge/Chromium 调试端口。") from exc
+
+        browser_match = re.search(r'"Browser"\s*:\s*"([^"]+)"', body)
+        user_agent_match = re.search(r'"User-Agent"\s*:\s*"([^"]+)"', body)
+        browser = browser_match.group(1) if browser_match else "未知浏览器"
+        user_agent = user_agent_match.group(1) if user_agent_match else ""
+
+        if "Edg/" not in user_agent and "Edge/" not in user_agent:
+            self.log("警告：9222 端口当前不是 Edge User-Agent，可能是 Chrome 或其他 Chromium 浏览器。")
+
+        return browser
 
     def test_connection(self) -> None:
         """仅测试连接，不执行任何业务操作。"""
@@ -156,40 +262,78 @@ class BossAutoGreeter:
         self.log(f"测试完成：已成功接管 {DEBUGGER_ADDRESS}。")
         self.log(f"提示：请确认该浏览器已登录 Boss 直聘账号。当前 URL：{self.safe_get_url(page)}")
 
-    def run(self, keyword: str, city: str, min_salary_k: int, max_count: int) -> None:
+    def run(
+        self,
+        keyword: str,
+        city: str,
+        min_salary_k: int,
+        max_count: int,
+        experience_filter: str = "不限",
+        blocked_companies: Optional[list[str]] = None,
+    ) -> None:
         """执行完整自动海投流程。"""
         sent_count = 0
+        blocked_companies = blocked_companies or []
         page = self.connect_page()
 
         self.log("开始执行任务。若页面要求登录、验证码或安全验证，请先在接管的 Edge 中手动处理。")
-        self.navigate_and_search(page, keyword, city)
+        experience_applied = self.navigate_and_search(page, keyword, city, experience_filter)
+        if experience_filter and experience_filter != "不限":
+            self.log(f"工作经验限制：{experience_filter}")
+            if experience_applied:
+                self.log("已检测到页面工作经验筛选生效，卡片侧仅做同义词宽松校验。")
+        if blocked_companies:
+            self.log(f"公司限制关键词：{'；'.join(blocked_companies)}")
 
-        page_index = 1
+        batch_index = 1
+        empty_scroll_rounds = 0
+        seen_job_keys = set()
         while not self.stop_event.is_set() and sent_count < max_count:
-            self.log(f"开始遍历第 {page_index} 页职位卡片。")
+            self.log(f"开始遍历第 {batch_index} 批已加载职位卡片。")
             cards = self.wait_job_cards(page)
 
             if not cards:
                 self.log("未识别到职位卡片，可能页面结构变化、未登录或搜索结果为空。")
                 break
 
+            processed_this_batch = 0
             for idx, card in enumerate(cards, start=1):
                 if self.stop_event.is_set() or sent_count >= max_count:
                     break
 
-                job_name = self.extract_text_from_child(card, JOB_NAME_SELECTORS) or "未识别职位名"
-                salary_text = self.extract_text_from_child(card, SALARY_SELECTORS) or "未识别薪资"
-                top_k = parse_salary_top_k(salary_text)
+                raw_salary_text = self.extract_text_from_child(card, SALARY_SELECTORS) or "未识别薪资"
+                salary_text = normalize_boss_obfuscated_digits(raw_salary_text)
+                job_name = clean_job_name(self.extract_text_from_child(card, JOB_NAME_SELECTORS), raw_salary_text)
+                company_text = self.extract_company_text(card)
+                card_text = normalize_boss_obfuscated_digits((getattr(card, "text", "") or "")).lower()
+                job_key = f"{job_name}|{salary_text}"
+                if job_key in seen_job_keys:
+                    continue
+                seen_job_keys.add(job_key)
+                processed_this_batch += 1
+
+                if not self.card_matches_experience(card, experience_filter, experience_applied):
+                    self.log(f"[跳过] 第 {idx} 个职位：{job_name}，原因：工作经验不符合 {experience_filter}。")
+                    continue
+
+                blocked_keyword = self.find_blocked_company_keyword(company_text, card_text, blocked_companies)
+                if blocked_keyword:
+                    company_log = company_text or "未识别公司"
+                    self.log(f"[跳过] 第 {idx} 个职位：{job_name}，公司：{company_log}，命中公司限制：{blocked_keyword}。")
+                    continue
+
+                top_k = parse_salary_top_k(raw_salary_text)
+                salary_log_text = salary_text if salary_text == raw_salary_text else f"{raw_salary_text} -> {salary_text}"
 
                 if top_k is None:
-                    self.log(f"[跳过] 第 {idx} 个职位：{job_name}，薪资：{salary_text}，原因：非月薪 K 或无法解析。")
+                    self.log(f"[跳过] 第 {idx} 个职位：{job_name}，薪资：{salary_log_text}，原因：非月薪 K 或无法解析。")
                     continue
 
                 if top_k < min_salary_k:
-                    self.log(f"[跳过] 第 {idx} 个职位：{job_name}，薪资上限 {top_k}K < {min_salary_k}K。")
+                    self.log(f"[跳过] 第 {idx} 个职位：{job_name}，薪资：{salary_log_text}，薪资上限 {top_k}K < {min_salary_k}K。")
                     continue
 
-                self.log(f"[符合] 第 {idx} 个职位：{job_name}，薪资：{salary_text}，准备点击立即沟通。")
+                self.log(f"[符合] 第 {idx} 个职位：{job_name}，薪资：{salary_log_text}，准备点击立即沟通。")
                 self.human_pause("点击前随机等待")
                 self.random_scroll(page)
 
@@ -203,21 +347,27 @@ class BossAutoGreeter:
             if sent_count >= max_count:
                 break
 
-            self.human_pause("翻页前随机等待")
-            self.random_scroll(page)
-            if not self.goto_next_page(page):
-                self.log("未找到可用的下一页按钮，任务结束。")
+            self.log(f"本批新处理职位数：{processed_this_batch}，累计已见职位数：{len(seen_job_keys)}。")
+
+            self.human_pause("加载更多职位前随机等待")
+            if not self.scroll_load_more_jobs(page, seen_job_keys):
+                empty_scroll_rounds += 1
+                self.log(f"本次滚动未发现新职位，连续无新增次数：{empty_scroll_rounds}/3。")
+            else:
+                empty_scroll_rounds = 0
+
+            if empty_scroll_rounds >= 3:
+                self.log("连续多次滚动后未发现新职位，任务结束。")
                 break
 
-            page_index += 1
-            self.wait_page_loaded_soft(page)
+            batch_index += 1
 
         if self.stop_event.is_set():
             self.log(f"任务已被用户强制停止，已成功沟通 {sent_count} 个职位。")
         else:
             self.log(f"任务完成，累计成功沟通 {sent_count} 个职位。")
 
-    def navigate_and_search(self, page: ChromiumPage, keyword: str, city: str) -> None:
+    def navigate_and_search(self, page: ChromiumPage, keyword: str, city: str, experience_filter: str = "不限") -> bool:
         """打开 Boss 首页，切换城市，并搜索目标岗位。"""
         current_url = self.safe_get_url(page)
         if "zhipin.com" not in current_url:
@@ -238,16 +388,60 @@ class BossAutoGreeter:
             pass
         search_input.input(keyword)
 
-        search_button = self.find_first(page, SEARCH_BUTTON_SELECTORS, timeout=3)
-        if search_button:
-            search_button.click()
-        else:
-            # 搜索按钮找不到时，使用 Enter 触发搜索。
+        if not self.click_search_button(page):
+            self.log("未能直接点击搜索按钮，改用回车触发搜索。")
             search_input.input("\n")
 
         self.wait_page_loaded_soft(page)
         self.wait_job_cards(page)
+        experience_applied = self.apply_experience_filter(page, experience_filter)
+        if experience_filter and experience_filter != "不限":
+            self.wait_page_loaded_soft(page)
+            self.wait_job_cards(page)
         self.log("搜索结果已加载，进入职位遍历。")
+        return experience_applied
+
+    def apply_experience_filter(self, page: ChromiumPage, experience_filter: str) -> bool:
+        """尽量点击 Boss 顶部工作经验筛选；失败时交给卡片侧过滤兜底。"""
+        if not experience_filter or experience_filter == "不限":
+            return False
+
+        self.log(f"尝试选择工作经验：{experience_filter}")
+        try:
+            trigger = self.find_first(
+                page,
+                [
+                    "xpath://button[contains(., '工作经验')]",
+                    "xpath://a[contains(., '工作经验')]",
+                    "xpath://span[contains(., '工作经验')]",
+                    "xpath://div[contains(., '工作经验') and string-length(normalize-space(.)) < 20]",
+                ],
+                timeout=4,
+            )
+            if trigger:
+                self.safe_click(trigger, "工作经验筛选")
+                time.sleep(0.8)
+
+            option = self.find_first(
+                page,
+                [
+                    f"xpath://li[normalize-space()='{experience_filter}']",
+                    f"xpath://a[normalize-space()='{experience_filter}']",
+                    f"xpath://span[normalize-space()='{experience_filter}']",
+                    f"xpath://div[normalize-space()='{experience_filter}']",
+                ],
+                timeout=4,
+            )
+            if option:
+                self.safe_click(option, f"工作经验选项 {experience_filter}")
+                self.log(f"已选择工作经验：{experience_filter}")
+                time.sleep(1.5)
+                return True
+            else:
+                self.log("未找到工作经验下拉选项，将使用卡片文本进行经验过滤。")
+        except Exception as exc:
+            self.log(f"选择工作经验失败，将使用卡片文本进行经验过滤：{exc}")
+        return False
 
     def try_choose_city(self, page: ChromiumPage, city: str) -> None:
         """尽量切换城市；若页面结构不匹配，记录日志并继续搜索。"""
@@ -255,7 +449,7 @@ class BossAutoGreeter:
         try:
             city_entry = self.find_first(page, CITY_SELECTORS, timeout=5)
             if city_entry:
-                city_entry.click()
+                self.safe_click(city_entry, "城市入口")
                 time.sleep(1)
 
             city_option = self.find_first(
@@ -268,7 +462,7 @@ class BossAutoGreeter:
                 timeout=5,
             )
             if city_option:
-                city_option.click()
+                self.safe_click(city_option, "城市选项")
                 self.log(f"城市已切换为：{city}")
                 self.wait_page_loaded_soft(page)
             else:
@@ -292,7 +486,7 @@ class BossAutoGreeter:
         try:
             # 部分页面需要先点卡片，再在详情区域点击立即沟通。
             try:
-                card.click()
+                self.safe_click(card, "职位卡片")
                 time.sleep(1.2)
             except Exception:
                 pass
@@ -304,7 +498,7 @@ class BossAutoGreeter:
             if not button:
                 return False
 
-            button.click()
+            self.safe_click(button, "立即沟通按钮")
             time.sleep(1.8)
             return True
         except Exception as exc:
@@ -314,12 +508,21 @@ class BossAutoGreeter:
     def close_or_leave_dialog(self, page: ChromiumPage) -> None:
         """处理聊天窗口、发送简历、确认弹窗等拦截，尽量回到列表页继续。"""
         try:
+            # Boss 发出消息后常弹出 “已向BOSS发送消息”，必须点“留在此页”。
+            # 点“继续沟通”会进入聊天页，点右上角关闭有时也会让页面状态卡住。
+            stay_btn = self.find_first(page, STAY_ON_PAGE_SELECTORS, timeout=3)
+            if stay_btn:
+                self.safe_click(stay_btn, "留在此页按钮")
+                self.log("已点击“留在此页”，继续处理职位列表。")
+                time.sleep(0.8)
+                return
+
             # 先尝试点击各种关闭/取消按钮。
             for selector in CLOSE_POPUP_SELECTORS:
                 try:
                     close_btn = page.ele(selector, timeout=1)
                     if close_btn:
-                        close_btn.click()
+                        self.safe_click(close_btn, "弹窗关闭按钮")
                         self.log("已自动关闭弹窗或对话框。")
                         time.sleep(0.8)
                         return
@@ -335,17 +538,45 @@ class BossAutoGreeter:
         except Exception as exc:
             self.log(f"弹窗处理异常，继续执行后续任务：{exc}")
 
-    def goto_next_page(self, page: ChromiumPage) -> bool:
-        """点击下一页。"""
+    def scroll_load_more_jobs(self, page: ChromiumPage, seen_job_keys: set[str]) -> bool:
+        """新版 Boss 搜索结果使用无限滚动，不点击分页，只滚动加载更多职位。"""
         try:
-            next_btn = self.find_first(page, NEXT_PAGE_SELECTORS, timeout=4)
-            if not next_btn:
-                return False
-            next_btn.click()
-            self.log("已点击下一页。")
-            return True
+            before_count = len(self.find_all_first_match(page, JOB_CARD_SELECTORS))
+            distance = random.randint(900, 1600)
+            js = f"""
+            const containers = Array.from(document.querySelectorAll('*')).filter((el) => {{
+                const style = window.getComputedStyle(el);
+                return /(auto|scroll)/.test(style.overflowY)
+                    && el.scrollHeight > el.clientHeight + 100
+                    && el.getBoundingClientRect().height > 200;
+            }});
+            const target = containers.sort((a, b) => b.scrollHeight - a.scrollHeight)[0];
+            if (target) {{
+                target.scrollBy(0, {distance});
+            }} else {{
+                window.scrollBy(0, {distance});
+            }}
+            return true;
+            """
+            page.run_js(js)
+            self.log(f"已向下滚动加载更多职位：{distance}px。")
+            time.sleep(random.uniform(2.0, 3.5))
+            after_count = len(self.find_all_first_match(page, JOB_CARD_SELECTORS))
+            if after_count > before_count:
+                self.log(f"检测到职位列表增加：{before_count} -> {after_count}。")
+                return True
+
+            # 虚拟列表可能复用 DOM 节点，数量不变但内容已刷新；检查是否出现新的职位 key。
+            for card in self.find_all_first_match(page, JOB_CARD_SELECTORS):
+                raw_salary_text = self.extract_text_from_child(card, SALARY_SELECTORS) or "未识别薪资"
+                salary_text = normalize_boss_obfuscated_digits(raw_salary_text)
+                job_name = clean_job_name(self.extract_text_from_child(card, JOB_NAME_SELECTORS), raw_salary_text)
+                if f"{job_name}|{salary_text}" not in seen_job_keys:
+                    self.log("职位卡片数量未增加，但检测到虚拟列表刷新出新职位。")
+                    return True
+            return False
         except Exception as exc:
-            self.log(f"点击下一页失败：{exc}")
+            self.log(f"滚动加载更多失败：{exc}")
             return False
 
     def human_pause(self, reason: str) -> None:
@@ -392,12 +623,114 @@ class BossAutoGreeter:
                 continue
         return []
 
+    def click_search_button(self, page: ChromiumPage) -> bool:
+        """点击当前页面可见的搜索按钮，避开自动补全浮层和隐藏 DOM。"""
+        js = """
+        const nodes = Array.from(document.querySelectorAll('button,a,span,div'));
+        const target = nodes.find((el) => {
+            const text = (el.innerText || el.textContent || '').trim();
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return text === '搜索'
+                && rect.width > 0
+                && rect.height > 0
+                && style.visibility !== 'hidden'
+                && style.display !== 'none';
+        });
+        if (target) {
+            target.click();
+            return true;
+        }
+        return false;
+        """
+        try:
+            if page.run_js(js):
+                self.log("已通过可见按钮触发搜索。")
+                return True
+        except Exception as exc:
+            self.log(f"JS 搜索点击失败，尝试普通定位点击：{exc}")
+
+        for selector in SEARCH_BUTTON_SELECTORS:
+            try:
+                for button in page.eles(selector):
+                    if self.safe_click(button, "搜索按钮", raise_error=False):
+                        self.log("已通过候选按钮触发搜索。")
+                        return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
+    def safe_click(ele, desc: str = "元素", raise_error: bool = True) -> bool:
+        """更稳的点击：普通点击失败时使用 JS 点击兜底。"""
+        try:
+            ele.click()
+            return True
+        except Exception as first_exc:
+            try:
+                ele.click(by_js=True)
+                return True
+            except Exception:
+                try:
+                    ele.run_js("this.click();")
+                    return True
+                except Exception as final_exc:
+                    if raise_error:
+                        raise RuntimeError(f"{desc}点击失败：{first_exc} / {final_exc}") from final_exc
+                    return False
+
     def extract_text_from_child(self, card, selectors: Iterable[str]) -> str:
         """从卡片内部提取文本，失败时回退到卡片全文。"""
         child = self.find_first(card, selectors, timeout=1)
         if child:
             return (getattr(child, "text", "") or "").strip()
         return (getattr(card, "text", "") or "").strip()
+
+    def extract_company_text(self, card) -> str:
+        """提取公司名；选择器失败时从卡片底部文本粗略兜底。"""
+        company = self.extract_text_from_child(card, COMPANY_SELECTORS)
+        company = normalize_boss_obfuscated_digits(company).strip()
+        if company:
+            # 选择器过宽时可能拿到多行，优先取像公司名的最后几行。
+            lines = [line.strip() for line in company.splitlines() if line.strip()]
+            if lines:
+                return lines[-1]
+
+        text = normalize_boss_obfuscated_digits((getattr(card, "text", "") or "")).strip()
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if len(lines) >= 2:
+            return lines[-2]
+        return ""
+
+    def card_matches_experience(self, card, experience_filter: str, page_filter_applied: bool = False) -> bool:
+        """根据卡片文本二次校验经验限制，防止页面筛选失效。"""
+        if not experience_filter or experience_filter == "不限":
+            return True
+
+        text = normalize_boss_obfuscated_digits((getattr(card, "text", "") or ""))
+        aliases = EXPERIENCE_ALIASES.get(experience_filter, [experience_filter])
+        if any(alias in text for alias in aliases):
+            return True
+
+        # Boss 顶部筛选已生效时，部分卡片会显示“在校/应届”等短标签，
+        # 也有卡片文本提取不完整。此时不因卡片侧缺词误杀。
+        if page_filter_applied:
+            known_experience_words = set(EXPERIENCE_OPTIONS + ["在校", "应届", "在校/应届", "校招"])
+            if not any(word in text for word in known_experience_words):
+                return True
+
+        return False
+
+    @staticmethod
+    def find_blocked_company_keyword(company_text: str, card_text: str, blocked_companies: list[str]) -> str:
+        """公司黑名单模糊匹配，命中返回关键词。"""
+        company_lower = normalize_boss_obfuscated_digits(company_text or "").lower()
+        card_lower = normalize_boss_obfuscated_digits(card_text or "").lower()
+        for keyword in blocked_companies:
+            key = keyword.strip().lower()
+            if key and (key in company_lower or key in card_lower):
+                return keyword
+        return ""
 
     @staticmethod
     def wait_page_loaded_soft(page: ChromiumPage) -> None:
@@ -461,17 +794,21 @@ class BossAutoGreeterApp(ctk.CTk):
         self.city_var = ctk.StringVar(value="杭州")
         self.min_salary_var = ctk.StringVar(value="18")
         self.max_count_var = ctk.StringVar(value="50")
+        self.experience_var = ctk.StringVar(value="不限")
+        self.blocked_companies_var = ctk.StringVar(value="")
 
         self._add_labeled_entry(left, "目标岗位关键词", self.keyword_var, 1)
         self._add_labeled_entry(left, "工作地点", self.city_var, 2)
-        self._add_labeled_entry(left, "期望薪资下限（K）", self.min_salary_var, 3)
-        self._add_labeled_entry(left, "最大沟通数量", self.max_count_var, 4)
+        self._add_labeled_option(left, "工作经验限制", self.experience_var, EXPERIENCE_OPTIONS, 3)
+        self._add_labeled_entry(left, "期望薪资下限（K）", self.min_salary_var, 4)
+        self._add_labeled_entry(left, "最大沟通数量", self.max_count_var, 5)
+        self._add_labeled_entry(left, "公司限制（用；分割）", self.blocked_companies_var, 6)
 
         self.test_button = ctk.CTkButton(left, text="测试浏览器连接", command=self.on_test_connection, height=40)
-        self.test_button.grid(row=5, column=0, sticky="ew", padx=18, pady=(18, 8))
+        self.test_button.grid(row=7, column=0, sticky="ew", padx=18, pady=(18, 8))
 
         self.start_button = ctk.CTkButton(left, text="开始运行应用", command=self.on_start, height=42)
-        self.start_button.grid(row=6, column=0, sticky="ew", padx=18, pady=8)
+        self.start_button.grid(row=8, column=0, sticky="ew", padx=18, pady=8)
 
         self.stop_button = ctk.CTkButton(
             left,
@@ -481,16 +818,16 @@ class BossAutoGreeterApp(ctk.CTk):
             fg_color="#8b1e2d",
             hover_color="#a32639",
         )
-        self.stop_button.grid(row=7, column=0, sticky="ew", padx=18, pady=8)
+        self.stop_button.grid(row=9, column=0, sticky="ew", padx=18, pady=8)
 
         hint = (
             "运行前请先启动 Edge：\n"
             "\"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\" "
             "--remote-debugging-port=9222 "
-            "--user-data-dir=\"D:\\BossAutoGreeterProfile\""
+            "--user-data-dir=\"C:\\tmp\\BossAutoGreeterProfile\""
         )
         self.hint_label = ctk.CTkLabel(left, text=hint, justify="left", wraplength=260, text_color="#a9b4c2")
-        self.hint_label.grid(row=8, column=0, sticky="ew", padx=18, pady=(18, 12))
+        self.hint_label.grid(row=10, column=0, sticky="ew", padx=18, pady=(18, 12))
 
         right = ctk.CTkFrame(self, corner_radius=8)
         right.grid(row=0, column=1, sticky="nsew", padx=(10, 16), pady=16)
@@ -516,6 +853,18 @@ class BossAutoGreeterApp(ctk.CTk):
 
         entry = ctk.CTkEntry(wrapper, textvariable=variable, height=38)
         entry.grid(row=1, column=0, sticky="ew")
+
+    @staticmethod
+    def _add_labeled_option(parent, label_text: str, variable: ctk.StringVar, values: list[str], row: int) -> None:
+        wrapper = ctk.CTkFrame(parent, fg_color="transparent")
+        wrapper.grid(row=row, column=0, sticky="ew", padx=18, pady=8)
+        wrapper.grid_columnconfigure(0, weight=1)
+
+        label = ctk.CTkLabel(wrapper, text=label_text, anchor="w")
+        label.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+
+        option = ctk.CTkOptionMenu(wrapper, variable=variable, values=values, height=38)
+        option.grid(row=1, column=0, sticky="ew")
 
     def log_to_ui(self, message: str) -> None:
         """线程安全日志入口：后台线程只入队，真正写 UI 由主线程完成。"""
@@ -551,6 +900,8 @@ class BossAutoGreeterApp(ctk.CTk):
         try:
             keyword = self.keyword_var.get().strip() or "后端开发"
             city = self.city_var.get().strip() or "杭州"
+            experience_filter = self.experience_var.get().strip() or "不限"
+            blocked_companies = split_blocked_companies(self.blocked_companies_var.get().strip())
             min_salary_k = int(self.min_salary_var.get().strip())
             max_count = int(self.max_count_var.get().strip())
             if min_salary_k <= 0 or max_count <= 0:
@@ -562,7 +913,7 @@ class BossAutoGreeterApp(ctk.CTk):
         self.stop_event.clear()
         self.worker_thread = threading.Thread(
             target=self._run_worker,
-            args=(keyword, city, min_salary_k, max_count),
+            args=(keyword, city, min_salary_k, max_count, experience_filter, blocked_companies),
             daemon=True,
         )
         self.worker_thread.start()
@@ -578,9 +929,24 @@ class BossAutoGreeterApp(ctk.CTk):
             self.log_to_ui(f"浏览器连接测试失败：{exc}")
             self.log_to_ui("请确认 Edge 已按 9222 端口命令启动，并且没有被其他程序独占。")
 
-    def _run_worker(self, keyword: str, city: str, min_salary_k: int, max_count: int) -> None:
+    def _run_worker(
+        self,
+        keyword: str,
+        city: str,
+        min_salary_k: int,
+        max_count: int,
+        experience_filter: str,
+        blocked_companies: list[str],
+    ) -> None:
         try:
-            BossAutoGreeter(self.log_to_ui, self.stop_event).run(keyword, city, min_salary_k, max_count)
+            BossAutoGreeter(self.log_to_ui, self.stop_event).run(
+                keyword,
+                city,
+                min_salary_k,
+                max_count,
+                experience_filter,
+                blocked_companies,
+            )
         except Exception as exc:
             self.log_to_ui(f"任务异常终止：{exc}")
             self.log_to_ui(traceback.format_exc())
